@@ -1,0 +1,53 @@
+name: build-linux-amd64
+run-name: build linux/amd64 ${{ github.sha }}
+
+# Fork-only lean build: on every push to main, cross-compile the server for
+# linux/amd64 and upload the binary as a downloadable Actions artifact.
+# Deliberately independent of the upstream author's self-hosted / goreleaser
+# automation so it just works on a personal fork with GitHub-hosted runners.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build (linux/amd64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X 'main.Version=${VERSION}-plus' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" \
+            -o dist/cli-proxy-api-plus \
+            ./cmd/server
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-proxy-api-plus-linux-amd64-${{ github.sha }}
+          path: dist/cli-proxy-api-plus
+          if-no-files-found: error
+          retention-days: 90
