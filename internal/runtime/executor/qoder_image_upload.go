@@ -31,6 +31,11 @@ const qoderImageUploadPath = "/api/v2/image/upload"
 // image_url.url (see chat.proto ContentPart.image_url), so the upload is a
 // payload-size / WAF optimization for large images rather than a requirement.
 // Enable with QODER_IMAGE_UPLOAD=1 (or true/yes/on).
+//
+// EXPERIMENTAL: the exact upload host + signing scheme is not yet nailed down —
+// api3/center both return 404 in testing, so the upload currently falls back to
+// inline base64 (which is fully verified end-to-end). Keep this off until the
+// endpoint is confirmed; the fallback guarantees images still forward either way.
 func qoderImageUploadEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_IMAGE_UPLOAD"))) {
 	case "1", "true", "yes", "on":
@@ -107,7 +112,9 @@ func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *clipro
 	body := buf.Bytes()
 
 	reqID := strings.ReplaceAll(uuid.New().String(), "-", "")
-	url := qoderauth.QoderCenterBase + qoderImageUploadPath + "?request_id=" + reqID
+	// qodercli uploads via the inference endpoint (endpointType:"infer" →
+	// api3.qoder.sh), same base as chat/model-list, path /api/v2/image/upload.
+	url := qoderauth.QoderInferURL + qoderImageUploadPath + "?request_id=" + reqID
 
 	headers, err := qoderauth.BuildAuthHeaders(body, url, qoderauth.CosyCredentials{
 		UserID:    storage.UserID,
