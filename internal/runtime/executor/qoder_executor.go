@@ -91,14 +91,14 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	toolsRaw := chatReq["tools"]
 	normalized, systemText := normalizeQoderMessages(messagesRaw)
 
-	// Optionally pre-upload inline base64 images to Qoder and rewrite them to
-	// URL references (mirrors the official qodercli flow, which uploads then
-	// keeps base64 only as a fallback). Off by default; enable with
-	// QODER_IMAGE_UPLOAD=1. Any upload failure silently keeps the inline
-	// base64, which Qoder also accepts, so this never breaks image forwarding.
-	if qoderImageUploadEnabled() {
-		e.uploadQoderImagesInMessages(ctx, authRecord, storage, normalized)
-	}
+	// Pre-upload large inline base64 images to Qoder and rewrite them to URL
+	// references (mirrors the official qodercli flow, which uploads then keeps
+	// base64 only as a fallback). Default "auto": images over the size threshold
+	// upload, smaller ones stay inline. Tunable via QODER_IMAGE_UPLOAD
+	// (auto/always/never) and QODER_IMAGE_UPLOAD_THRESHOLD. Any upload failure
+	// keeps the inline base64, which Qoder also accepts, so image forwarding
+	// never breaks.
+	e.uploadQoderImagesInMessages(ctx, authRecord, storage, normalized)
 
 	// Resolve the per-model server-side metadata (is_vl, is_reasoning,
 	// max_input_tokens, ...). Failing here is a hard error — sending the

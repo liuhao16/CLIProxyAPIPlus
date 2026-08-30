@@ -24,25 +24,45 @@ import (
 // multipart/form-data body, field name "file"). Mirrors qodercli's x_i.
 const qoderImageUploadPath = "/api/v2/image/upload"
 
-// qoderImageUploadEnabled reports whether inline base64 images should be
-// pre-uploaded to Qoder (and rewritten to URL references) before a chat call.
+// defaultQoderImageUploadThreshold is the raw-byte size above which an inline
+// base64 image is pre-uploaded (in "auto" mode) rather than sent inline. Large
+// inline images bloat the chat payload and risk the Alibaba Cloud WAF / size
+// limits on the chat endpoint, so big images go through the dedicated upload
+// endpoint while small ones stay inline to avoid an extra round-trip.
+const defaultQoderImageUploadThreshold = 65536 // 64 KiB of decoded image bytes
+
+// qoderImageUploadMode returns how inline base64 images should be handled,
+// controlled by the QODER_IMAGE_UPLOAD env var:
 //
-// This is opt-in because Qoder already accepts inline data: base64 URLs in
-// image_url.url (see chat.proto ContentPart.image_url), so the upload is a
-// payload-size / WAF optimization for large images rather than a requirement.
-// Enable with QODER_IMAGE_UPLOAD=1 (or true/yes/on).
+//	"" / auto (default) — upload images whose decoded size exceeds the
+//	                      threshold; keep smaller images inline.
+//	1 / always / on     — upload every image.
+//	0 / never / off     — never upload; always keep inline base64.
 //
-// EXPERIMENTAL: the exact upload host + signing scheme is not yet nailed down —
-// api3/center both return 404 in testing, so the upload currently falls back to
-// inline base64 (which is fully verified end-to-end). Keep this off until the
-// endpoint is confirmed; the fallback guarantees images still forward either way.
-func qoderImageUploadEnabled() bool {
+// Upload targets the device-token CENTER endpoint
+// (center.qoder.sh/algo/api/v2/image/upload, COSY-signed over the body length)
+// and always falls back to inline base64 on any failure, so image forwarding
+// never breaks regardless of mode.
+func qoderImageUploadMode() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_IMAGE_UPLOAD"))) {
-	case "1", "true", "yes", "on":
-		return true
+	case "0", "off", "never", "false", "no":
+		return "never"
+	case "1", "on", "always", "true", "yes":
+		return "always"
 	default:
-		return false
+		return "auto"
 	}
+}
+
+// qoderImageUploadThreshold is the decoded-byte size above which "auto" mode
+// uploads, overridable via QODER_IMAGE_UPLOAD_THRESHOLD (bytes).
+func qoderImageUploadThreshold() int {
+	if v := strings.TrimSpace(os.Getenv("QODER_IMAGE_UPLOAD_THRESHOLD")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultQoderImageUploadThreshold
 }
 
 // uploadQoderImagesInMessages walks the normalized messages and, for every
@@ -56,6 +76,11 @@ func qoderImageUploadEnabled() bool {
 // {"type":"image_url","image_url":{"url":"data:...;base64,..."}}. Remote http(s)
 // image_url values are left untouched.
 func (e *QoderExecutor) uploadQoderImagesInMessages(ctx context.Context, authRecord *cliproxyauth.Auth, storage *qoderauth.QoderTokenStorage, messages []interface{}) {
+	mode := qoderImageUploadMode()
+	if mode == "never" {
+		return
+	}
+	threshold := qoderImageUploadThreshold()
 	for _, m := range messages {
 		msg, ok := m.(map[string]interface{})
 		if !ok {
@@ -80,11 +105,18 @@ func (e *QoderExecutor) uploadQoderImagesInMessages(ctx context.Context, authRec
 				// Not an inline base64 image (e.g. a remote https URL) — skip.
 				continue
 			}
+			// In auto mode small images stay inline (no extra round-trip); only
+			// images past the threshold are uploaded. "always" uploads all.
+			rawLen := len(data) * 3 / 4
+			if mode == "auto" && rawLen <= threshold {
+				continue
+			}
 			uploaded, err := e.uploadQoderImage(ctx, authRecord, storage, mediaType, data)
 			if err != nil || uploaded == "" {
 				log.Warnf("qoder image-upload: upload failed, keeping inline base64: %v", err)
 				continue
 			}
+			log.Infof("qoder image-upload: uploaded %d-byte %s image -> %s", len(data), mediaType, uploaded)
 			imgURL["url"] = uploaded
 		}
 	}
@@ -112,11 +144,19 @@ func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *clipro
 	body := buf.Bytes()
 
 	reqID := strings.ReplaceAll(uuid.New().String(), "-", "")
-	// qodercli uploads via the inference endpoint (endpointType:"infer" →
-	// api3.qoder.sh), same base as chat/model-list, path /api/v2/image/upload.
-	url := qoderauth.QoderInferURL + qoderImageUploadPath + "?request_id=" + reqID
+	// Device-token accounts upload via the CENTER endpoint. qodercli's Tv() URL
+	// joiner inserts an "/algo" gateway segment before the path, so the real
+	// URL is center.qoder.sh/algo/api/v2/image/upload — the missing /algo is why
+	// a naive center-host PUT 404s.
+	url := qoderauth.QoderCenterBase + "/algo" + qoderImageUploadPath + "?request_id=" + reqID
 
-	headers, err := qoderauth.BuildAuthHeaders(body, url, qoderauth.CosyCredentials{
+	// The upload's COSY signature is computed over the body *length string*, not
+	// the multipart bytes: qodercli signs it via
+	// prepareRequest(endpoint, path, "PUT", "auth", String(body.length), _).
+	// Passing the raw bytes (as a normal chat request would) yields HTTP 403
+	// "Signature invalid". The real bytes are still sent as the HTTP body below.
+	sigBody := []byte(strconv.Itoa(len(body)))
+	headers, err := qoderauth.BuildAuthHeaders(sigBody, url, qoderauth.CosyCredentials{
 		UserID:    storage.UserID,
 		AuthToken: storage.Token,
 		Name:      storage.Name,
