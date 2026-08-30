@@ -91,6 +91,15 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	toolsRaw := chatReq["tools"]
 	normalized, systemText := normalizeQoderMessages(messagesRaw)
 
+	// Optionally pre-upload inline base64 images to Qoder and rewrite them to
+	// URL references (mirrors the official qodercli flow, which uploads then
+	// keeps base64 only as a fallback). Off by default; enable with
+	// QODER_IMAGE_UPLOAD=1. Any upload failure silently keeps the inline
+	// base64, which Qoder also accepts, so this never breaks image forwarding.
+	if qoderImageUploadEnabled() {
+		e.uploadQoderImagesInMessages(ctx, authRecord, storage, normalized)
+	}
+
 	// Resolve the per-model server-side metadata (is_vl, is_reasoning,
 	// max_input_tokens, ...). Failing here is a hard error — sending the
 	// wrong block silently downgrades to a different model.
@@ -426,6 +435,117 @@ func extractContentGeneric(content interface{}) string {
 	}
 }
 
+// buildQoderContent converts an OpenAI chat message's content into the shape
+// Qoder's chat endpoint accepts. Text-only content collapses to a plain string
+// (Qoder's default). When the content array carries images we preserve them as
+// OpenAI-style image_url parts — which is exactly what Qoder's chat ContentPart
+// expects (see the official qodercli chat.proto: ContentPart.image_url{url,detail},
+// and its lXa transform that emits {type:"image_url",image_url:{url}}).
+//
+// By the time this runs the SDK translators have already normalized every
+// source format to OpenAI chat, so images arrive as
+// {"type":"image_url","image_url":{"url":...}} where url is either a
+// data:<mime>;base64,... inline payload (Claude Code / Codex both land here)
+// or a remote https URL. text/image order is preserved.
+func buildQoderContent(content interface{}) interface{} {
+	arr, ok := content.([]interface{})
+	if !ok {
+		return extractContentGeneric(content)
+	}
+
+	parts := make([]interface{}, 0, len(arr))
+	textParts := make([]string, 0, len(arr))
+	hasImage := false
+	flushText := func() {
+		if len(textParts) > 0 {
+			parts = append(parts, map[string]interface{}{
+				"type": "text",
+				"text": strings.Join(textParts, "\n"),
+			})
+			textParts = textParts[:0]
+		}
+	}
+
+	for _, item := range arr {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if img := qoderImageURLPart(itemMap); img != nil {
+			flushText()
+			parts = append(parts, img)
+			hasImage = true
+			continue
+		}
+		if text, ok := itemMap["text"].(string); ok && text != "" {
+			textParts = append(textParts, text)
+		}
+	}
+
+	if !hasImage {
+		return strings.Join(textParts, "\n")
+	}
+	flushText()
+	return parts
+}
+
+// qoderImageURLPart returns a clean OpenAI image_url content part for an
+// incoming part, or nil when it is not a usable image. It tolerates both the
+// canonical chat object form (image_url:{url,detail}) and a bare string
+// image_url, and skips empty URLs (remote http(s) and data: URLs both pass
+// through — Qoder accepts either as image_url.url).
+func qoderImageURLPart(item map[string]interface{}) map[string]interface{} {
+	if t, _ := item["type"].(string); t != "image_url" {
+		return nil
+	}
+	url := ""
+	var detail string
+	switch v := item["image_url"].(type) {
+	case map[string]interface{}:
+		url, _ = v["url"].(string)
+		detail, _ = v["detail"].(string)
+	case string:
+		url = v
+	}
+	if url == "" {
+		return nil
+	}
+	imgURL := map[string]interface{}{"url": url}
+	if detail != "" {
+		imgURL["detail"] = detail
+	}
+	return map[string]interface{}{"type": "image_url", "image_url": imgURL}
+}
+
+// parseImageDataURL extracts the mime type and raw base64 payload from a
+// data:<mime>;base64,<payload> URL. Non-data URLs (e.g. remote http links) or
+// non-base64 data URLs return ok=false.
+func parseImageDataURL(url string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(url, "data:") {
+		return "", "", false
+	}
+	meta, payload, found := strings.Cut(url[len("data:"):], ",")
+	if !found || payload == "" {
+		return "", "", false
+	}
+	fields := strings.Split(meta, ";")
+	mediaType = strings.TrimSpace(fields[0])
+	if mediaType == "" {
+		return "", "", false
+	}
+	isBase64 := false
+	for _, f := range fields[1:] {
+		if strings.EqualFold(strings.TrimSpace(f), "base64") {
+			isBase64 = true
+			break
+		}
+	}
+	if !isBase64 {
+		return "", "", false
+	}
+	return mediaType, payload, true
+}
+
 // normalizeQoderMessages clones each message and applies sanitizations
 // required by Qoder's upstream:
 //
@@ -459,7 +579,10 @@ func normalizeQoderMessages(messages []interface{}) (normalized []interface{}, s
 		for k, v := range msgMap {
 			cloned[k] = v
 		}
-		cloned["content"] = extractContentGeneric(msgMap["content"])
+		// Preserve multimodal image parts (as OpenAI image_url) instead of
+		// flattening to text — Qoder's chat endpoint accepts image_url content
+		// parts. Text-only content still collapses to a plain string.
+		cloned["content"] = buildQoderContent(msgMap["content"])
 		out = append(out, cloned)
 	}
 	return out, strings.Join(systemParts, "\n\n")
