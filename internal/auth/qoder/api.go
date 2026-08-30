@@ -47,6 +47,7 @@ var ModelMap = map[string]string{
 	"gm51model":     "gm51model",     // GLM 5.1
 	"kmodel":        "kmodel",        // Kimi K2.6
 	"mmodel":        "mmodel",        // MiniMax M3
+	"cmodel":        "cmodel",        // Cantus — unlocked at Cosy-Version >= 1.13.3
 }
 
 // doRefreshToken performs a token refresh and persists the result to authFilePath.

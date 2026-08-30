@@ -39,7 +39,14 @@ const (
 	// Cosy-Version header (captured from live traffic). Earlier builds sent
 	// 0.14.2 (IDE) and qoder2api sends 0.1.43 — server accepts any of these
 	// as long as headers are consistent. Bump cautiously.
-	QoderIDEVersion = "1.0.0"
+	//
+	// Bumped to 1.27.1: the /algo/api/v2/model/list endpoint gates newer
+	// models on this version (compared against each model's minimal_version).
+	// At 1.0.0 the server returns 15 models; a higher version also returns
+	// "cmodel" (Cantus, minimal_version.ide 1.13.3). Signing chat requests
+	// with the same version is required for those newer models to be callable,
+	// so this constant is bumped globally rather than only for the list call.
+	QoderIDEVersion = "1.27.1"
 	// QoderClientType is the client type advertised in the Cosy-Clienttype
 	// header. NPM qodercli (0.2.16) sends "5" (CLI). IDE/web sends "0".
 	QoderClientType = "5"
