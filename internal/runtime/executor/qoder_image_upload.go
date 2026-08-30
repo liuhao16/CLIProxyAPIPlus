@@ -3,13 +3,16 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +27,34 @@ import (
 // multipart/form-data body, field name "file"). Mirrors qodercli's x_i.
 const qoderImageUploadPath = "/api/v2/image/upload"
 
+// qoderImageURLCache dedupes uploads of identical image bytes across requests
+// and conversation turns — the same picture (keyed by user + content hash) is
+// uploaded once and its resulting URL reused, mirroring qodercli's HzA/p9e
+// content cache. The uploaded qoder OSS URLs are unsigned/permanent object
+// links, so caching them is safe. A crude size cap keeps memory bounded.
+var (
+	qoderImageURLCacheMu sync.Mutex
+	qoderImageURLCache   = map[string]string{}
+)
+
+const qoderImageURLCacheMax = 1024
+
+func qoderImageCacheGet(key string) (string, bool) {
+	qoderImageURLCacheMu.Lock()
+	defer qoderImageURLCacheMu.Unlock()
+	v, ok := qoderImageURLCache[key]
+	return v, ok
+}
+
+func qoderImageCachePut(key, url string) {
+	qoderImageURLCacheMu.Lock()
+	defer qoderImageURLCacheMu.Unlock()
+	if len(qoderImageURLCache) >= qoderImageURLCacheMax {
+		qoderImageURLCache = map[string]string{}
+	}
+	qoderImageURLCache[key] = url
+}
+
 // defaultQoderImageUploadThreshold is the raw-byte size above which an inline
 // base64 image is pre-uploaded (in "auto" mode) rather than sent inline. Large
 // inline images bloat the chat payload and risk the Alibaba Cloud WAF / size
@@ -32,12 +63,14 @@ const qoderImageUploadPath = "/api/v2/image/upload"
 const defaultQoderImageUploadThreshold = 65536 // 64 KiB of decoded image bytes
 
 // qoderImageUploadMode returns how inline base64 images should be handled,
-// controlled by the QODER_IMAGE_UPLOAD env var:
+// controlled by the QODER_IMAGE_UPLOAD env var. The default matches the
+// official qodercli behavior: upload every image, fall back to inline base64
+// only when the upload fails.
 //
-//	"" / auto (default) — upload images whose decoded size exceeds the
-//	                      threshold; keep smaller images inline.
-//	1 / always / on     — upload every image.
-//	0 / never / off     — never upload; always keep inline base64.
+//	"" / always (default) — upload every image (official behavior).
+//	auto                  — upload only images past the size threshold; keep
+//	                        smaller images inline (saves a round-trip).
+//	0 / never / off       — never upload; always keep inline base64.
 //
 // Upload targets the device-token CENTER endpoint
 // (center.qoder.sh/algo/api/v2/image/upload, COSY-signed over the body length)
@@ -47,10 +80,10 @@ func qoderImageUploadMode() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_IMAGE_UPLOAD"))) {
 	case "0", "off", "never", "false", "no":
 		return "never"
-	case "1", "on", "always", "true", "yes":
-		return "always"
-	default:
+	case "auto":
 		return "auto"
+	default:
+		return "always"
 	}
 }
 
@@ -116,7 +149,6 @@ func (e *QoderExecutor) uploadQoderImagesInMessages(ctx context.Context, authRec
 				log.Warnf("qoder image-upload: upload failed, keeping inline base64: %v", err)
 				continue
 			}
-			log.Infof("qoder image-upload: uploaded %d-byte %s image -> %s", len(data), mediaType, uploaded)
 			imgURL["url"] = uploaded
 		}
 	}
@@ -126,6 +158,14 @@ func (e *QoderExecutor) uploadQoderImagesInMessages(ctx context.Context, authRec
 // and returns the URL the server assigns. The multipart body is signed with the
 // same COSY scheme used for chat.
 func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *cliproxyauth.Auth, storage *qoderauth.QoderTokenStorage, mediaType, b64 string) (string, error) {
+	// Content cache: identical bytes for the same user reuse a prior upload URL,
+	// so a picture repeated across conversation turns is only uploaded once.
+	sum := sha256.Sum256([]byte(b64))
+	cacheKey := storage.UserID + ":" + hex.EncodeToString(sum[:])
+	if cached, ok := qoderImageCacheGet(cacheKey); ok {
+		return cached, nil
+	}
+
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return "", fmt.Errorf("decode base64: %w", err)
@@ -150,6 +190,28 @@ func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *clipro
 	// a naive center-host PUT 404s.
 	url := qoderauth.QoderCenterBase + "/algo" + qoderImageUploadPath + "?request_id=" + reqID
 
+	// Retry transient auth/server failures (mirrors qodercli's 401/403 retry).
+	// Each attempt re-signs with a fresh timestamp/request-id.
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		result, status, err := e.doQoderImageUpload(ctx, authRecord, storage, url, body, boundary)
+		if err == nil {
+			qoderImageCachePut(cacheKey, result)
+			return result, nil
+		}
+		lastErr = err
+		// Only retry on transient auth (401/403) or server (5xx) statuses.
+		if status != http.StatusUnauthorized && status != http.StatusForbidden && status < 500 {
+			break
+		}
+	}
+	return "", lastErr
+}
+
+// doQoderImageUpload performs a single COSY-signed PUT of the multipart body and
+// returns the assigned URL. status is the HTTP status (0 on transport error) so
+// the caller can decide whether to retry.
+func (e *QoderExecutor) doQoderImageUpload(ctx context.Context, authRecord *cliproxyauth.Auth, storage *qoderauth.QoderTokenStorage, url string, body []byte, boundary string) (result string, status int, err error) {
 	// The upload's COSY signature is computed over the body *length string*, not
 	// the multipart bytes: qodercli signs it via
 	// prepareRequest(endpoint, path, "PUT", "auth", String(body.length), _).
@@ -164,12 +226,12 @@ func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *clipro
 		MachineID: storage.MachineID,
 	})
 	if err != nil {
-		return "", fmt.Errorf("build COSY auth: %w", err)
+		return "", 0, fmt.Errorf("build COSY auth: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
+		return "", 0, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	httpReq.Header.Set("Accept", "application/json")
@@ -180,21 +242,22 @@ func (e *QoderExecutor) uploadQoderImage(ctx context.Context, authRecord *clipro
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, authRecord, 60*time.Second)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
-		return "", fmt.Errorf("upload request: %w", err)
+		return "", 0, fmt.Errorf("upload request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("upload HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
+		return "", resp.StatusCode, fmt.Errorf("upload HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
 	}
 
 	// Match qodercli's U_i URL extraction order.
 	for _, path := range []string{"url", "result.url", "result.oss_url", "data.url", "data.oss_url"} {
 		if v := gjson.GetBytes(respBody, path).String(); v != "" {
-			return v, nil
+			log.Infof("qoder image-upload: uploaded %d-byte multipart -> %s", len(body), v)
+			return v, resp.StatusCode, nil
 		}
 	}
-	return "", fmt.Errorf("upload response missing url: %s", truncate(string(respBody), 300))
+	return "", resp.StatusCode, fmt.Errorf("upload response missing url: %s", truncate(string(respBody), 300))
 }
 
 // qoderImageExt maps a media type to the file extension qodercli uses for the
