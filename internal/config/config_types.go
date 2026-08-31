@@ -56,6 +56,49 @@ type KiroFingerprintConfig struct {
 	KiroHash            string `yaml:"kiro-hash,omitempty" json:"kiro-hash,omitempty"`
 }
 
+// QoderConfig groups Qoder provider settings maintained by this fork.
+type QoderConfig struct {
+	// Queue configures how the proxy behaves when the Qoder upstream places
+	// a request in its waiting queue (403 / code=10605 / isQueued:true).
+	Queue QoderQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
+}
+
+// QoderQueueConfig tunes the model-queue wait behavior. This mirrors the
+// official qodercli, which does not fail on a queue signal but polls a
+// dedicated queue-status endpoint until the model is ready (or a total wait
+// budget is exhausted). All durations accept Go duration strings
+// (e.g. "1h", "30s", "500ms").
+type QoderQueueConfig struct {
+	// Enabled toggles queue handling. When false the proxy surfaces the
+	// upstream 403 immediately (legacy behavior). Defaults to true.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxWait is the total time budget spent waiting in queue for a single
+	// request. Matches qodercli's QODER_MODEL_QUEUE_MAX_WAIT_MS (default 1h).
+	MaxWait string `yaml:"max-wait,omitempty" json:"max-wait,omitempty"`
+	// PollInterval is the fallback wait between queue-status polls when the
+	// server does not supply retryAfterSeconds. Default 30s.
+	PollInterval string `yaml:"poll-interval,omitempty" json:"poll-interval,omitempty"`
+	// MinBackoff / MaxBackoff clamp the server-supplied retryAfterSeconds so
+	// a bad value can neither hammer the upstream nor stall us. Official CLI
+	// clamps to [500ms, 30s].
+	MinBackoff string `yaml:"min-backoff,omitempty" json:"min-backoff,omitempty"`
+	MaxBackoff string `yaml:"max-backoff,omitempty" json:"max-backoff,omitempty"`
+	// PollTimeout bounds a single queue-status request. Default 30s.
+	PollTimeout string `yaml:"poll-timeout,omitempty" json:"poll-timeout,omitempty"`
+	// UseStatusEndpoint controls the wait strategy. When true (default) the
+	// proxy polls the official queue-status endpoint and only re-issues the
+	// inference request once the model reports ready. When false it falls
+	// back to blindly re-sending the inference request after each backoff.
+	UseStatusEndpoint *bool `yaml:"use-status-endpoint,omitempty" json:"use-status-endpoint,omitempty"`
+	// ReportFinish toggles the official queue-finish callback
+	// (POST /api/v2/service/ask/finish). The official qodercli fires it after a
+	// queued request completes to report how long the model was waited on; it
+	// is a best-effort usage-statistics ping and does not affect whether the
+	// result is obtained. Defaults to true. Only sent when a queue wait
+	// actually occurred and a user id / requestSetId is available.
+	ReportFinish *bool `yaml:"report-finish,omitempty" json:"report-finish,omitempty"`
+}
+
 // KiroRateLimitConfig defines Kiro request rate limiting parameters.
 type KiroRateLimitConfig struct {
 	Enabled           *bool   `yaml:"enabled,omitempty" json:"enabled,omitempty"`

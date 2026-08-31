@@ -616,6 +616,29 @@ nonstream-keepalive-interval: 0
 #  backoff-multiplier: 1.5      # exponential backoff multiplier (default: 1.5)
 #  suspend-cooldown: "1h"       # cooldown after suspension keywords detected (default: 1h)
 
+# Qoder provider configuration.
+# The `queue` block controls how the proxy waits out the Qoder upstream's model
+# queue. Qoder returns a 403 with code=10605 / isQueued:true when your request
+# is placed in a waiting queue; instead of surfacing that error, the proxy waits
+# it out the way the official qodercli does — polling a dedicated queue-status
+# endpoint until the model is ready, then re-issuing the inference request.
+# All fields are optional; omitted fields use the qodercli-aligned defaults below.
+#qoder:
+#  queue:
+#    enabled: true                # wait out the queue instead of returning 403 (default: true)
+#    use-status-endpoint: true    # poll the queue-status endpoint (true, official) vs. blindly
+#                                 # re-send the inference request after each backoff (false)
+#    max-wait: "1h"               # total time budget spent waiting per request (default: 1h)
+#    poll-interval: "30s"         # wait between polls when the server omits retryAfterSeconds (default: 30s)
+#    min-backoff: "500ms"         # lower clamp on the server-supplied retryAfterSeconds (default: 500ms)
+#    max-backoff: "30s"           # upper clamp on the server-supplied retryAfterSeconds (default: 30s)
+#    poll-timeout: "30s"          # per queue-status request timeout (default: 30s)
+#    report-finish: true          # after a queued request completes, fire the official
+#                                 # queue-finish callback (POST /api/v2/service/ask/finish)
+#                                 # to report how long the model was waited on. Best-effort
+#                                 # usage statistics only; does not affect results. Fired only
+#                                 # when the request actually waited in queue. (default: true)
+
 # Controls whether system prompts are wrapped with --- SYSTEM PROMPT --- markers
 # and injected into Kiro user messages. Kiro/Amazon Q API has no native system
 # field, so when enabled the proxy prepends the wrapped system prompt to the

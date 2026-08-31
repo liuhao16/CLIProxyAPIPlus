@@ -25,6 +25,21 @@ const (
 	// QoderModelListURL is the full URL for /algo/api/v2/model/list on the
 	// inference host. The endpoint uses COSY signing; pass an empty body.
 	QoderModelListURL = QoderInferURL + "/algo/api/v2/model/list"
+	// QoderQueueStatusPath is the relative path (without the /algo prefix) of
+	// the model-queue status endpoint the official qodercli polls while a
+	// request waits in the upstream queue. It is a signed GET; callers append
+	// requestSetId / modelKey / queueType query parameters.
+	QoderQueueStatusPath = "/api/v2/service/ask/queue/status"
+	// QoderQueueStatusURL is the full URL for the queue-status endpoint.
+	QoderQueueStatusURL = QoderInferURL + "/algo" + QoderQueueStatusPath
+	// QoderQueueFinishPath is the relative path (without the /algo prefix) of the
+	// queue-finish callback the official qodercli fires after a queued request
+	// completes. It is a best-effort usage-statistics ping; the body is the same
+	// QoderEncodeBody-encoded scheme as the chat endpoint (hence ?Encode=1).
+	QoderQueueFinishPath = "/api/v2/service/ask/finish"
+	// QoderQueueFinishURLEncoded is the full URL for the queue-finish endpoint,
+	// with Encode=1 so the encoded body is accepted.
+	QoderQueueFinishURLEncoded = QoderInferURL + "/algo" + QoderQueueFinishPath + "?Encode=1"
 )
 
 // ModelMap is the canonical set of model identifiers Qoder accepts. Based on

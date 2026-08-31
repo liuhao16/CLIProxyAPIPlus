@@ -118,6 +118,10 @@ type Config struct {
 	// KiroRateLimit configures Kiro request rate limiting.
 	KiroRateLimit *KiroRateLimitConfig `yaml:"kiro-rate-limit,omitempty" json:"kiro-rate-limit,omitempty"`
 
+	// Qoder configures provider-wide Qoder request behavior, including how the
+	// proxy waits out the upstream's model queue.
+	Qoder QoderConfig `yaml:"qoder,omitempty" json:"qoder,omitempty"`
+
 	KiroSystemPromptInjectEnable *bool `yaml:"kiro-system-prompt-inject-enable,omitempty" json:"kiro-system-prompt-inject-enable,omitempty"`
 	KiroTruncationDetectorEnable *bool `yaml:"kiro-truncation-detector-enable,omitempty" json:"kiro-truncation-detector-enable,omitempty"`
 	KiroExtractThinkingTagEnable *bool `yaml:"kiro-extract-thinking-tag-enable,omitempty" json:"kiro-extract-thinking-tag-enable,omitempty"`

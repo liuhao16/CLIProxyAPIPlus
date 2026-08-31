@@ -617,6 +617,139 @@ func TestNewQoderStatusError(t *testing.T) {
 	}
 }
 
+func TestParseQoderQueue(t *testing.T) {
+	// Real body as logged by CLIProxyAPIPlus for a queued 403: the queue
+	// payload is nested/escaped several layers deep inside `message`.
+	queuedBody := `{"code":"403","message":"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":true,\\\"modelKey\\\":\\\"gpt\\\",\\\"queueCount\\\":301,\\\"queueType\\\":\\\"slow\\\",\\\"retryAfterSeconds\\\":30,\\\"serviceAvailable\\\":true,\\\"waitTime\\\":181}\"}"}`
+
+	info, retriable := parseQoderQueue(queuedBody)
+	if !retriable {
+		t.Fatalf("expected queued body to be retriable, got info=%+v", info)
+	}
+	if !info.queued {
+		t.Errorf("expected queued=true")
+	}
+	if info.retryAfter != 30*time.Second {
+		t.Errorf("retryAfter = %s, want 30s", info.retryAfter)
+	}
+	if info.queueCount != 301 {
+		t.Errorf("queueCount = %d, want 301", info.queueCount)
+	}
+	if info.waitTime != 181 {
+		t.Errorf("waitTime = %d, want 181", info.waitTime)
+	}
+	if info.modelKey != "gpt" {
+		t.Errorf("modelKey = %q, want %q", info.modelKey, "gpt")
+	}
+	if info.queueType != "slow" {
+		t.Errorf("queueType = %q, want %q", info.queueType, "slow")
+	}
+	if !info.serviceAvailable {
+		t.Errorf("serviceAvailable = false, want true")
+	}
+	defaults := resolveQoderQueueSettings(nil)
+	if b := info.backoff(defaults); b != 30*time.Second {
+		t.Errorf("backoff = %s, want 30s", b)
+	}
+
+	// serviceAvailable:false is STILL a retriable queue signal — the official
+	// qodercli keeps waiting through it rather than failing. We only surface
+	// the flag; the wait loop tolerates it.
+	unavailable := `{"code":"403","message":"{\"isQueued\":true,\"retryAfterSeconds\":30,\"serviceAvailable\":false}"}`
+	uinfo, retriable := parseQoderQueue(unavailable)
+	if !retriable {
+		t.Errorf("serviceAvailable:false should still be retriable (qodercli waits through it)")
+	}
+	if uinfo.serviceAvailable {
+		t.Errorf("serviceAvailable should be parsed as false")
+	}
+
+	// A plain signature-invalid 403 must not be treated as a queue.
+	hard := `{"code":"403","message":"Signature invalid"}`
+	if _, retriable := parseQoderQueue(hard); retriable {
+		t.Errorf("hard 403 should not be retriable")
+	}
+
+	// Empty / garbage body must not panic or match.
+	if _, retriable := parseQoderQueue(""); retriable {
+		t.Errorf("empty body should not be retriable")
+	}
+	if _, retriable := parseQoderQueue("not json"); retriable {
+		t.Errorf("garbage body should not be retriable")
+	}
+
+	// Missing retryAfterSeconds falls back to the default poll interval.
+	noRetry := `{"isQueued":true,"queueCount":5,"serviceAvailable":true}`
+	info2, retriable := parseQoderQueue(noRetry)
+	if !retriable {
+		t.Fatalf("expected retriable")
+	}
+	if b := info2.backoff(defaults); b != qoderQueueDefaultPoll {
+		t.Errorf("backoff = %s, want default poll %s", b, qoderQueueDefaultPoll)
+	}
+}
+
+func TestResolveQoderQueueSettings(t *testing.T) {
+	// nil config → all qodercli-aligned defaults.
+	d := resolveQoderQueueSettings(nil)
+	if !d.enabled || !d.useStatusEndpoint {
+		t.Errorf("defaults should be enabled + useStatusEndpoint, got %+v", d)
+	}
+	if d.maxWait != qoderQueueDefaultMaxWait {
+		t.Errorf("maxWait = %s, want %s", d.maxWait, qoderQueueDefaultMaxWait)
+	}
+	if d.minBackoff != qoderQueueDefaultMinBackoff || d.maxBackoff != qoderQueueDefaultMaxBackoff {
+		t.Errorf("backoff clamp = [%s,%s], want [%s,%s]", d.minBackoff, d.maxBackoff, qoderQueueDefaultMinBackoff, qoderQueueDefaultMaxBackoff)
+	}
+
+	// Config overrides are honored; durations parse from strings.
+	disabled := false
+	cfg := &config.Config{}
+	cfg.Qoder.Queue = config.QoderQueueConfig{
+		Enabled:           &disabled,
+		MaxWait:           "2h",
+		PollInterval:      "15s",
+		MinBackoff:        "1s",
+		MaxBackoff:        "45s",
+		PollTimeout:       "10s",
+		UseStatusEndpoint: &disabled,
+	}
+	s := resolveQoderQueueSettings(cfg)
+	if s.enabled {
+		t.Errorf("enabled should be false")
+	}
+	if s.useStatusEndpoint {
+		t.Errorf("useStatusEndpoint should be false")
+	}
+	if s.maxWait != 2*time.Hour {
+		t.Errorf("maxWait = %s, want 2h", s.maxWait)
+	}
+	if s.pollInterval != 15*time.Second {
+		t.Errorf("pollInterval = %s, want 15s", s.pollInterval)
+	}
+	if s.minBackoff != 1*time.Second || s.maxBackoff != 45*time.Second {
+		t.Errorf("clamp = [%s,%s], want [1s,45s]", s.minBackoff, s.maxBackoff)
+	}
+	if s.pollTimeout != 10*time.Second {
+		t.Errorf("pollTimeout = %s, want 10s", s.pollTimeout)
+	}
+
+	// Bad/empty duration strings fall back to defaults; inverted clamp is fixed.
+	cfg2 := &config.Config{}
+	cfg2.Qoder.Queue = config.QoderQueueConfig{
+		MaxWait:    "garbage",
+		MinBackoff: "40s",
+		MaxBackoff: "10s", // min > max → min clamped down to max
+	}
+	s2 := resolveQoderQueueSettings(cfg2)
+	if s2.maxWait != qoderQueueDefaultMaxWait {
+		t.Errorf("bad maxWait should fall back to default, got %s", s2.maxWait)
+	}
+	if s2.minBackoff > s2.maxBackoff {
+		t.Errorf("inverted clamp not fixed: min=%s max=%s", s2.minBackoff, s2.maxBackoff)
+	}
+}
+
 // TestExecuteStream_ModelMapping tests model name mapping
 func TestExecuteStream_ModelMapping(t *testing.T) {
 	executor := NewQoderExecutor(&config.Config{})

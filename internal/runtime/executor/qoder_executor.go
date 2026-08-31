@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -197,64 +198,132 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	// The server decodes when &Encode=1 is present in the URL.
 	encodedBytes := []byte(helps.QoderEncodeBody(bodyBytes))
 
-	headers, err := qoderauth.BuildAuthHeaders(
-		encodedBytes,
-		qoderauth.QoderChatURLEncoded,
-		qoderauth.CosyCredentials{
-			UserID:    storage.UserID,
-			AuthToken: storage.Token,
-			Name:      storage.Name,
-			Email:     storage.Email,
-			MachineID: storage.MachineID,
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build COSY auth: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", qoderauth.QoderChatURLEncoded, bytes.NewReader(encodedBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
-	headers.Apply(httpReq)
 	modelSource, _ := modelConfig["source"].(string)
 	if modelSource == "" {
 		modelSource = "system"
 	}
-	httpReq.Header.Set("X-Model-Key", qoderModel)
-	httpReq.Header.Set("X-Model-Source", modelSource)
-	// Disable automatic gzip — Accept-Encoding: gzip triggers signature
-	// validation on the Qoder upstream and causes 403 Signature invalid.
-	httpReq.Header.Set("Accept-Encoding", "identity")
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, authRecord, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+
+	creds := qoderauth.CosyCredentials{
+		UserID:    storage.UserID,
+		AuthToken: storage.Token,
+		Name:      storage.Name,
+		Email:     storage.Email,
+		MachineID: storage.MachineID,
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
-		defer func() { _ = httpResp.Body.Close() }()
-		body, _ := io.ReadAll(httpResp.Body)
-		allow := httpResp.Header.Get("Allow")
-		server := httpResp.Header.Get("Server")
+	// sendInference issues one signed inference request. The COSY signature is
+	// rebuilt on every call because it carries a timestamp that would go stale
+	// across a queue wait.
+	sendInference := func() (*http.Response, error) {
+		headers, herr := qoderauth.BuildAuthHeaders(encodedBytes, qoderauth.QoderChatURLEncoded, creds)
+		if herr != nil {
+			return nil, fmt.Errorf("failed to build COSY auth: %w", herr)
+		}
+		httpReq, rerr := http.NewRequestWithContext(ctx, "POST", qoderauth.QoderChatURLEncoded, bytes.NewReader(encodedBytes))
+		if rerr != nil {
+			return nil, fmt.Errorf("failed to create request: %w", rerr)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+		headers.Apply(httpReq)
+		httpReq.Header.Set("X-Model-Key", qoderModel)
+		httpReq.Header.Set("X-Model-Source", modelSource)
+		// Disable automatic gzip — Accept-Encoding: gzip triggers signature
+		// validation on the Qoder upstream and causes 403 Signature invalid.
+		httpReq.Header.Set("Accept-Encoding", "identity")
+		return httpClient.Do(httpReq)
+	}
+
+	// Send the request, waiting out the upstream's model queue (403 /
+	// code=10605 / isQueued:true) per the resolved queue policy.
+	queue := resolveQoderQueueSettings(e.cfg)
+	var httpResp *http.Response
+	queueDeadline := time.Now().Add(queue.maxWait)
+	// queueWaitStart is set the first time this request is queued; it drives the
+	// time_consumed value reported by the official queue-finish callback and
+	// signals (non-zero) that a finish callback should be fired at all.
+	var queueWaitStart time.Time
+	var queueFinishModelKey string
+	for attempt := 0; ; attempt++ {
+		resp, derr := sendInference()
+		if derr != nil {
+			return nil, fmt.Errorf("request failed: %w", derr)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			httpResp = resp
+			break
+		}
+
+		// Non-200: read body once, decide whether it is a retriable queue
+		// signal or a hard error.
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		qinfo, retriable := parseQoderQueue(string(body))
+		if retriable && queue.enabled {
+			if queueWaitStart.IsZero() {
+				queueWaitStart = time.Now()
+			}
+			// Prefer the upstream-reported modelKey; fall back to the model we
+			// asked for. Used by the queue-finish callback.
+			if qinfo.modelKey != "" {
+				queueFinishModelKey = qinfo.modelKey
+			} else if queueFinishModelKey == "" {
+				queueFinishModelKey = qoderModel
+			}
+			// Prefer the official queue-status polling: ask the upstream when
+			// the model is ready instead of blindly re-sending the inference
+			// request. Falls back to a plain backoff-and-resend when disabled
+			// or when the queue signal lacks a requestSetId to poll with.
+			if queue.useStatusEndpoint && recordID != "" {
+				ready, werr := e.waitQoderQueue(ctx, httpClient, creds, recordID, sessionID, qoderModel, qinfo, queue, queueDeadline)
+				if werr != nil {
+					if errors.Is(werr, context.Canceled) || errors.Is(werr, context.DeadlineExceeded) {
+						return nil, werr
+					}
+					// Budget exhausted or unrecoverable poll failure: surface
+					// the original queue 403 to the client.
+					log.Warnf("qoder: queue wait ended without ready (attempt %d): %v; giving up", attempt+1, werr)
+					return nil, newQoderStatusError(resp.StatusCode, string(body))
+				}
+				_ = ready
+				continue
+			}
+
+			wait := qinfo.backoff(queue)
+			if time.Now().Add(wait).After(queueDeadline) {
+				log.Warnf("qoder: queue wait budget exhausted (attempt %d, queueCount=%d, waitTime=%ds); giving up", attempt+1, qinfo.queueCount, qinfo.waitTime)
+				return nil, newQoderStatusError(resp.StatusCode, string(body))
+			}
+			log.Infof("qoder: queued (attempt %d, queueCount=%d, waitTime=%ds); retrying in %s", attempt+1, qinfo.queueCount, qinfo.waitTime, wait)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+
+		// Hard error — log full diagnostics and surface it.
+		allow := resp.Header.Get("Allow")
+		server := resp.Header.Get("Server")
 		bodyPreview := truncate(string(body), 500)
 		log.WithFields(log.Fields{
 			"url":            qoderauth.QoderChatURL,
 			"server":         server,
-			"content_type":   httpResp.Header.Get("Content-Type"),
-			"x_request_id":   httpResp.Header.Get("X-Request-Id"),
-			"x_eagleeye_id":  httpResp.Header.Get("Eagleeye-Traceid"),
-			"x_oss_request":  httpResp.Header.Get("X-Oss-Request-Id"),
+			"content_type":   resp.Header.Get("Content-Type"),
+			"x_request_id":   resp.Header.Get("X-Request-Id"),
+			"x_eagleeye_id":  resp.Header.Get("Eagleeye-Traceid"),
+			"x_oss_request":  resp.Header.Get("X-Oss-Request-Id"),
 			"allow":          allow,
 			"body_truncated": bodyPreview,
-		}).Warnf("qoder: upstream %d allow=%q server=%q body=%q", httpResp.StatusCode, allow, server, bodyPreview)
-		return nil, newQoderStatusError(httpResp.StatusCode, string(body))
+		}).Warnf("qoder: upstream %d allow=%q server=%q body=%q", resp.StatusCode, allow, server, bodyPreview)
+		return nil, newQoderStatusError(resp.StatusCode, string(body))
 	}
 
 	// Create streaming channel
@@ -262,6 +331,22 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	go func() {
 		defer close(out)
 		defer func() { _ = httpResp.Body.Close() }()
+		// Fire the official queue-finish callback once the stream terminates
+		// (any exit path). Best-effort usage reporting; only when this request
+		// actually waited in queue and we have the identifiers to report with.
+		defer func() {
+			if queueWaitStart.IsZero() || !queue.reportFinish {
+				return
+			}
+			if recordID == "" || creds.UserID == "" {
+				return
+			}
+			mk := queueFinishModelKey
+			if mk == "" {
+				mk = qoderModel
+			}
+			e.finishQoderQueue(context.Background(), httpClient, creds, mk, recordID, time.Since(queueWaitStart))
+		}()
 
 		// Shared across all TranslateStream calls in this stream — the
 		// translator carries open-block / sequence state through it; a
@@ -653,6 +738,406 @@ func (e *qoderStatusError) Error() string {
 
 func (e *qoderStatusError) StatusCode() int {
 	return e.status
+}
+
+// Qoder queue-retry tuning defaults. When the upstream places the request in
+// a waiting queue it returns 403 with code=10605 and a nested JSON body
+// carrying {isQueued:true, retryAfterSeconds, serviceAvailable:true, ...}.
+// That is a soft/retriable signal — we wait it out rather than surfacing the
+// 403 to the client. These defaults mirror the official qodercli and are all
+// overridable via the `qoder.queue` config block.
+const (
+	// qoderQueueDefaultMaxWait matches qodercli's QODER_MODEL_QUEUE_MAX_WAIT_MS
+	// default of 36e5 ms (1 hour).
+	qoderQueueDefaultMaxWait = time.Hour
+	// qoderQueueDefaultPoll is used when the server omits retryAfterSeconds
+	// (qodercli's isl = 30s).
+	qoderQueueDefaultPoll = 30 * time.Second
+	// qoderQueueDefaultMinBackoff / qoderQueueDefaultMaxBackoff clamp the
+	// server-supplied retryAfterSeconds (qodercli's osl: [500ms, 30s]).
+	qoderQueueDefaultMinBackoff = 500 * time.Millisecond
+	qoderQueueDefaultMaxBackoff = 30 * time.Second
+	// qoderQueueDefaultPollTimeout bounds one queue-status request (qodercli's
+	// Bor = 30s).
+	qoderQueueDefaultPollTimeout = 30 * time.Second
+)
+
+// qoderQueueSettings is the resolved, ready-to-use queue configuration for a
+// single request, produced by resolveQoderQueueSettings from config + defaults.
+type qoderQueueSettings struct {
+	enabled           bool
+	maxWait           time.Duration
+	pollInterval      time.Duration
+	minBackoff        time.Duration
+	maxBackoff        time.Duration
+	pollTimeout       time.Duration
+	useStatusEndpoint bool
+	reportFinish      bool
+}
+
+// resolveQoderQueueSettings folds the qoder.queue config over the defaults.
+// Missing / unparsable values fall back to the qodercli-aligned defaults so a
+// partial config block still behaves sanely.
+func resolveQoderQueueSettings(cfg *config.Config) qoderQueueSettings {
+	s := qoderQueueSettings{
+		enabled:           true,
+		maxWait:           qoderQueueDefaultMaxWait,
+		pollInterval:      qoderQueueDefaultPoll,
+		minBackoff:        qoderQueueDefaultMinBackoff,
+		maxBackoff:        qoderQueueDefaultMaxBackoff,
+		pollTimeout:       qoderQueueDefaultPollTimeout,
+		useStatusEndpoint: true,
+		reportFinish:      true,
+	}
+	if cfg == nil {
+		return s
+	}
+	q := cfg.Qoder.Queue
+	if q.Enabled != nil {
+		s.enabled = *q.Enabled
+	}
+	if q.UseStatusEndpoint != nil {
+		s.useStatusEndpoint = *q.UseStatusEndpoint
+	}
+	if q.ReportFinish != nil {
+		s.reportFinish = *q.ReportFinish
+	}
+	if d, ok := parseDurationOpt(q.MaxWait); ok {
+		s.maxWait = d
+	}
+	if d, ok := parseDurationOpt(q.PollInterval); ok {
+		s.pollInterval = d
+	}
+	if d, ok := parseDurationOpt(q.MinBackoff); ok {
+		s.minBackoff = d
+	}
+	if d, ok := parseDurationOpt(q.MaxBackoff); ok {
+		s.maxBackoff = d
+	}
+	if d, ok := parseDurationOpt(q.PollTimeout); ok {
+		s.pollTimeout = d
+	}
+	// Guard against an inverted clamp from a bad config.
+	if s.maxBackoff > 0 && s.minBackoff > s.maxBackoff {
+		s.minBackoff = s.maxBackoff
+	}
+	return s
+}
+
+// parseDurationOpt parses a Go duration string, reporting ok=false for empty
+// or invalid input (so callers keep their default).
+func parseDurationOpt(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
+// qoderQueueInfo holds the parsed "you are in a waiting queue" signal.
+type qoderQueueInfo struct {
+	queued           bool
+	serviceAvailable bool
+	retryAfter       time.Duration
+	queueCount       int64
+	waitTime         int64
+	modelKey         string
+	queueType        string
+}
+
+// parseQoderQueue digs through the (multiply-escaped) 403 error body and
+// reports whether it is a retriable queue signal. The upstream nests the
+// payload several layers deep, e.g.:
+//
+//	{"code":"403","message":"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":true,
+//	 \\\"retryAfterSeconds\\\":30,\\\"queueCount\\\":301,\\\"serviceAvailable\\\":true,...}\"}"}
+//
+// gjson only sees the outer layer, so we peel `message` strings that are
+// themselves JSON until we find the object carrying isQueued.
+func parseQoderQueue(body string) (qoderQueueInfo, bool) {
+	var info qoderQueueInfo
+	// Peel up to a few layers of nested/escaped JSON-in-a-string.
+	cur := strings.TrimSpace(body)
+	for i := 0; i < 6 && cur != ""; i++ {
+		res := gjson.Parse(cur)
+		if !res.IsObject() {
+			break
+		}
+		if q := res.Get("isQueued"); q.Exists() && q.Bool() {
+			info.queued = true
+			info.retryAfter = time.Duration(res.Get("retryAfterSeconds").Int()) * time.Second
+			info.queueCount = res.Get("queueCount").Int()
+			info.waitTime = res.Get("waitTime").Int()
+			info.modelKey = res.Get("modelKey").String()
+			info.queueType = res.Get("queueType").String()
+			// serviceAvailable defaults to true when absent. Unlike the old
+			// implementation we do NOT treat serviceAvailable:false as fatal:
+			// the official qodercli keeps waiting through it, so it is still a
+			// retriable queue signal.
+			info.serviceAvailable = true
+			if sa := res.Get("serviceAvailable"); sa.Exists() {
+				info.serviceAvailable = sa.Bool()
+			}
+			return info, true
+		}
+		// Descend into the nested message string, if any.
+		msg := res.Get("message")
+		if !msg.Exists() {
+			break
+		}
+		next := strings.TrimSpace(msg.String())
+		if next == "" || next == cur {
+			break
+		}
+		cur = next
+	}
+	return info, false
+}
+
+// backoff returns the wait duration before the next queue poll/retry,
+// honoring the server's retryAfterSeconds and clamping to the configured
+// [minBackoff, maxBackoff] range (qodercli behavior). When the server omits
+// retryAfterSeconds, the configured pollInterval is used.
+func (q qoderQueueInfo) backoff(s qoderQueueSettings) time.Duration {
+	d := q.retryAfter
+	if d <= 0 {
+		d = s.pollInterval
+	}
+	if s.maxBackoff > 0 && d > s.maxBackoff {
+		d = s.maxBackoff
+	}
+	if s.minBackoff > 0 && d < s.minBackoff {
+		d = s.minBackoff
+	}
+	return d
+}
+
+// waitQoderQueue polls the upstream model-queue status endpoint until the
+// model reports ready (isQueued:false), the total wait budget (deadline) is
+// exhausted, or the context is cancelled. It mirrors the official qodercli:
+// it does not fail on serviceAvailable:false — it keeps waiting through it —
+// and it honors the server-supplied retryAfterSeconds between polls, clamped
+// to the configured [minBackoff, maxBackoff] range.
+//
+// On success (model ready) it returns nil and the caller re-issues the
+// inference request. It returns context errors verbatim so the caller can
+// propagate cancellation; any other error means "give up and surface the
+// original 403".
+func (e *QoderExecutor) waitQoderQueue(
+	ctx context.Context,
+	httpClient *http.Client,
+	creds qoderauth.CosyCredentials,
+	requestSetID, sessionID, fallbackModelKey string,
+	initial qoderQueueInfo,
+	s qoderQueueSettings,
+	deadline time.Time,
+) (qoderQueueInfo, error) {
+	cur := initial
+	for poll := 0; ; poll++ {
+		// Respect the total budget and honor cancellation while backing off.
+		wait := cur.backoff(s)
+		if time.Now().Add(wait).After(deadline) {
+			return cur, fmt.Errorf("qoder: queue wait budget exhausted (polls=%d, queueCount=%d, waitTime=%ds)", poll, cur.queueCount, cur.waitTime)
+		}
+		modelKey := cur.modelKey
+		if modelKey == "" {
+			modelKey = fallbackModelKey
+		}
+		log.Infof("qoder: queued (poll %d, queueCount=%d, waitTime=%ds, serviceAvailable=%t); next status check in %s", poll, cur.queueCount, cur.waitTime, cur.serviceAvailable, wait)
+		select {
+		case <-ctx.Done():
+			return cur, ctx.Err()
+		case <-time.After(wait):
+		}
+
+		next, ready, perr := e.pollQoderQueueStatus(ctx, httpClient, creds, requestSetID, sessionID, modelKey, cur.queueType, s)
+		if perr != nil {
+			if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
+				// Only propagate cancellation from the parent context; a
+				// per-poll timeout is a transient failure we retry through.
+				if ctx.Err() != nil {
+					return cur, ctx.Err()
+				}
+			}
+			// Transient poll failure: keep the previous queue info and retry
+			// until the budget runs out, matching qodercli's tolerance for
+			// intermittent status errors.
+			log.Warnf("qoder: queue status poll %d failed: %v; retrying", poll, perr)
+			continue
+		}
+		if ready {
+			// Model is ready. Honor a final short retryAfter before re-issuing.
+			if next.retryAfter > 0 {
+				finalWait := next.retryAfter
+				if s.maxBackoff > 0 && finalWait > s.maxBackoff {
+					finalWait = s.maxBackoff
+				}
+				if !time.Now().Add(finalWait).After(deadline) {
+					select {
+					case <-ctx.Done():
+						return next, ctx.Err()
+					case <-time.After(finalWait):
+					}
+				}
+			}
+			log.Infof("qoder: model ready after %d poll(s); re-issuing inference request", poll+1)
+			return next, nil
+		}
+		cur = next
+	}
+}
+
+// pollQoderQueueStatus issues one signed GET to the queue-status endpoint and
+// parses the response. It reports ready=true when the upstream says the model
+// is no longer queued (isQueued:false). The returned qoderQueueInfo carries
+// the fresh retryAfter/queueCount/etc for the next poll.
+func (e *QoderExecutor) pollQoderQueueStatus(
+	ctx context.Context,
+	httpClient *http.Client,
+	creds qoderauth.CosyCredentials,
+	requestSetID, sessionID, modelKey, queueType string,
+	s qoderQueueSettings,
+) (qoderQueueInfo, bool, error) {
+	q := url.Values{}
+	q.Set("requestSetId", requestSetID)
+	if modelKey != "" {
+		q.Set("modelKey", modelKey)
+	}
+	if queueType != "" {
+		q.Set("queueType", queueType)
+	}
+	statusURL := qoderauth.QoderQueueStatusURL + "?" + q.Encode()
+
+	// The queue-status GET is COSY-signed with an empty body, like the model
+	// list endpoint. BuildAuthHeaders derives the sig path from the URL.
+	headers, herr := qoderauth.BuildAuthHeaders(nil, statusURL, creds)
+	if herr != nil {
+		return qoderQueueInfo{}, false, fmt.Errorf("failed to build COSY auth for queue status: %w", herr)
+	}
+
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if s.pollTimeout > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, s.pollTimeout)
+		defer cancel()
+	}
+
+	httpReq, rerr := http.NewRequestWithContext(reqCtx, "GET", statusURL, nil)
+	if rerr != nil {
+		return qoderQueueInfo{}, false, fmt.Errorf("failed to create queue status request: %w", rerr)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	headers.Apply(httpReq)
+	httpReq.Header.Set("X-Model-Key", modelKey)
+	if sessionID != "" {
+		httpReq.Header.Set("X-Session-Id", sessionID)
+	}
+	httpReq.Header.Set("Accept-Encoding", "identity")
+
+	resp, derr := httpClient.Do(httpReq)
+	if derr != nil {
+		return qoderQueueInfo{}, false, derr
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+
+	// A queued response still parses as a queue signal (isQueued:true). When
+	// the model is ready the body reports isQueued:false (or omits it), which
+	// parseQoderQueue reports as retriable=false → ready.
+	info, stillQueued := parseQoderQueue(string(body))
+	if stillQueued {
+		return info, false, nil
+	}
+	// Not a queue signal. If the status endpoint returned a hard error status
+	// (auth expired, etc.), treat it as a poll failure so the caller can
+	// retry/give up rather than mistaking it for "ready".
+	if resp.StatusCode != http.StatusOK {
+		return qoderQueueInfo{}, false, fmt.Errorf("queue status HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	return info, true, nil
+}
+
+// finishQoderQueue fires the official queue-finish callback
+// (POST /algo/api/v2/service/ask/finish?Encode=1) after a queued request
+// completes. It mirrors the official qodercli: a best-effort usage-statistics
+// ping reporting how long the model was waited on. Errors are swallowed — the
+// result has already been streamed to the client and nothing here affects it.
+//
+// Wire format (from qodercli): the request body is
+//
+//	{"payload":"{\"model_key\":...,\"request_set_id\":...,\"user_id\":...,\"time_consumed\":<ms>}","encodeVersion":"1"}
+//
+// then run through the same QoderEncodeBody scheme as the chat endpoint (hence
+// the ?Encode=1 query flag) and COSY-signed over the encoded bytes.
+func (e *QoderExecutor) finishQoderQueue(
+	ctx context.Context,
+	httpClient *http.Client,
+	creds qoderauth.CosyCredentials,
+	modelKey, requestSetID string,
+	waited time.Duration,
+) {
+	timeConsumed := waited.Milliseconds()
+	if timeConsumed < 0 {
+		timeConsumed = 0
+	}
+
+	inner, err := json.Marshal(map[string]interface{}{
+		"model_key":      modelKey,
+		"request_set_id": requestSetID,
+		"user_id":        creds.UserID,
+		"time_consumed":  timeConsumed,
+	})
+	if err != nil {
+		return
+	}
+	outer, err := json.Marshal(map[string]interface{}{
+		"payload":       string(inner),
+		"encodeVersion": "1",
+	})
+	if err != nil {
+		return
+	}
+	encoded := []byte(helps.QoderEncodeBody(outer))
+
+	headers, herr := qoderauth.BuildAuthHeaders(encoded, qoderauth.QoderQueueFinishURLEncoded, creds)
+	if herr != nil {
+		log.Debugf("qoder: queue-finish auth build failed: %v", herr)
+		return
+	}
+
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if e != nil { // keep a bounded timeout regardless of caller ctx
+		reqCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+	}
+
+	httpReq, rerr := http.NewRequestWithContext(reqCtx, "POST", qoderauth.QoderQueueFinishURLEncoded, bytes.NewReader(encoded))
+	if rerr != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	headers.Apply(httpReq)
+	httpReq.Header.Set("X-Model-Key", modelKey)
+	httpReq.Header.Set("Accept-Encoding", "identity")
+
+	resp, derr := httpClient.Do(httpReq)
+	if derr != nil {
+		log.Debugf("qoder: queue-finish callback failed: %v", derr)
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Debugf("qoder: queue-finish callback HTTP %d", resp.StatusCode)
+		return
+	}
+	log.Debugf("qoder: queue-finish reported (model=%s, waited=%dms)", modelKey, timeConsumed)
 }
 
 // CountTokens estimates token count for the request (placeholder implementation)
