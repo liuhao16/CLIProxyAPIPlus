@@ -153,6 +153,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	e.applyOpenCodeSessionHeader(httpReq, auth, req, opts)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -247,6 +248,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	e.applyOpenCodeSessionHeader(httpReq, auth, req, opts)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -365,6 +367,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	e.applyOpenCodeSessionHeader(httpReq, auth, req, opts)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -604,6 +607,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	e.applyOpenCodeSessionHeader(httpReq, auth, req, opts)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -913,6 +917,18 @@ func (e *OpenAICompatExecutor) applyPromptCacheKey(ctx context.Context, auth *cl
 	}, "\x00")
 	promptCacheKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 	return helps.SetStringIfDifferent(translated, "prompt_cache_key", promptCacheKey), nil
+}
+
+func (e *OpenAICompatExecutor) applyOpenCodeSessionHeader(httpReq *http.Request, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) {
+	compat := e.resolveCompatConfig(auth)
+	if compat == nil || !compat.SendOpenCodeSession {
+		return
+	}
+	sessionID := helps.ProviderSessionUUID(e.provider, opts.Metadata, req.Metadata)
+	if sessionID == "" {
+		return
+	}
+	httpReq.Header.Set("x-opencode-session", sessionID)
 }
 
 func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (baseURL, apiKey string) {

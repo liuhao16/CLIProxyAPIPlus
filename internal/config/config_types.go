@@ -61,6 +61,10 @@ type QoderConfig struct {
 	// Queue configures how the proxy behaves when the Qoder upstream places
 	// a request in its waiting queue (403 / code=10605 / isQueued:true).
 	Queue QoderQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
+	// VPCEndpoint selects a Qoder CN Enterprise VPC deployment. It accepts either
+	// an instance name or its base, gateway, or OpenAPI domain. Empty keeps the
+	// public global Qoder endpoints.
+	VPCEndpoint string `yaml:"vpc-endpoint,omitempty" json:"vpc-endpoint,omitempty"`
 }
 
 // QoderQueueConfig tunes the model-queue wait behavior. This mirrors the
@@ -770,6 +774,9 @@ type OpenAICompatibility struct {
 
 	// SupportPromptCacheKey enables derived prompt_cache_key injection for supported requests.
 	SupportPromptCacheKey bool `yaml:"support-prompt-cache-key,omitempty" json:"support-prompt-cache-key,omitempty"`
+
+	// SendOpenCodeSession enables derived x-opencode-session header injection for supported requests.
+	SendOpenCodeSession bool `yaml:"send-opencode-session,omitempty" json:"send-opencode-session,omitempty"`
 
 	// DisableCooling overrides the global cooling policy for this provider when set.
 	// True disables auth/model cooldowns; false explicitly enables them.

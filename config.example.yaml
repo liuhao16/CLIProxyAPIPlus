@@ -139,6 +139,13 @@ redis-usage-queue-retention-seconds: 60
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Qoder provider settings. Leave vpc-endpoint empty for the public global service.
+# Qoder CN Enterprise VPC accepts an instance name or its dedicated domain,
+# for example "acme" or "acme.vpc.qoder.com.cn". Do not include https:// or a path.
+# Set QODERCN_PERSONAL_ACCESS_TOKEN before running --qoder-login to use PAT authentication.
+# qoder:
+#   vpc-endpoint: "acme.vpc.qoder.com.cn"
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 
@@ -684,6 +691,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
 #     support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols
+#     send-opencode-session: false # optional: derive x-opencode-session for requests from all input protocols (OpenCode Go)
 #     disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
 #     request-retry: 3 # optional: per-provider override of the global request-retry; 0 disables retries; omit or set < 0 to use the global value
 #     request-scoped-errors: # optional: custom rules to classify upstream errors by status and body patterns

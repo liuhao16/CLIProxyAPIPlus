@@ -52,13 +52,18 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	if !ok {
 		return nil, fmt.Errorf("invalid auth storage type for qoder: %T", authRecord.Storage)
 	}
+	endpoints, errEndpoints := qoderauth.ResolveEndpoints(e.cfg)
+	if errEndpoints != nil {
+		return nil, errEndpoints
+	}
+	chatURL := endpoints.ChatURL()
+	encodedChatURL := endpoints.EncodedChatURL()
 
-	// Note: Qoder device tokens are long-lived (~30 days) and the upstream
-	// /algo/api/v3/user/refresh_token endpoint returns 403 for them — see
-	// QoderExecutor.Refresh's no-op rationale. We deliberately do not call
-	// RefreshTokenIfNeeded per request: it would just produce a 403 in the
-	// log on every chat call. Token expiry is handled by the user re-running
-	// --qoder-login.
+	// Refresh a PAT-derived Job Token before it expires. Legacy browser
+	// device-token credentials remain untouched and keep their old behavior.
+	if errRefresh := refreshQoderJobTokenIfNeeded(ctx, authRecord, e.cfg); errRefresh != nil {
+		return nil, errRefresh
+	}
 
 	// Translate non-openai formats to chat completions before extracting messages
 	payload := req.Payload
@@ -207,22 +212,25 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 	httpClient = reporter.TrackHTTPClient(httpClient)
 
 	creds := qoderauth.CosyCredentials{
-		UserID:    storage.UserID,
-		AuthToken: storage.Token,
-		Name:      storage.Name,
-		Email:     storage.Email,
-		MachineID: storage.MachineID,
+		UserID:           storage.UserID,
+		AuthToken:        storage.Token,
+		Name:             storage.Name,
+		Email:            storage.Email,
+		MachineID:        storage.MachineID,
+		OrganizationID:   storage.OrganizationID,
+		OrganizationTags: storage.OrganizationTags,
+		EnterpriseVPC:    endpoints.VPCInstance != "",
 	}
 
 	// sendInference issues one signed inference request. The COSY signature is
 	// rebuilt on every call because it carries a timestamp that would go stale
 	// across a queue wait.
 	sendInference := func() (*http.Response, error) {
-		headers, herr := qoderauth.BuildAuthHeaders(encodedBytes, qoderauth.QoderChatURLEncoded, creds)
+		headers, herr := qoderauth.BuildAuthHeaders(encodedBytes, encodedChatURL, creds)
 		if herr != nil {
 			return nil, fmt.Errorf("failed to build COSY auth: %w", herr)
 		}
-		httpReq, rerr := http.NewRequestWithContext(ctx, "POST", qoderauth.QoderChatURLEncoded, bytes.NewReader(encodedBytes))
+		httpReq, rerr := http.NewRequestWithContext(ctx, "POST", encodedChatURL, bytes.NewReader(encodedBytes))
 		if rerr != nil {
 			return nil, fmt.Errorf("failed to create request: %w", rerr)
 		}
@@ -314,7 +322,7 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, authRecord *cliproxya
 		server := resp.Header.Get("Server")
 		bodyPreview := truncate(string(body), 500)
 		log.WithFields(log.Fields{
-			"url":            qoderauth.QoderChatURL,
+			"url":            chatURL,
 			"server":         server,
 			"content_type":   resp.Header.Get("Content-Type"),
 			"x_request_id":   resp.Header.Get("X-Request-Id"),
@@ -1338,25 +1346,67 @@ func (e *QoderExecutor) Execute(ctx context.Context, authRecord *cliproxyauth.Au
 	}, nil
 }
 
-// Refresh is a no-op for Qoder.
-//
-// Qoder's device-flow token (the "dt-..." string) is already long-lived
-// (~30 days for the access token, ~360 days for the refresh token per
-// the deviceToken/poll response). The upstream does not expose the
-// classic OAuth refresh dance — every endpoint we've observed (cubk1's
-// qoder2api, Veria, the official @qoder-ai/qodercli) either skips
-// refresh entirely or routes through a different /jobToken exchange
-// flow that requires personalToken (we don't have one).
-//
-// Hitting /algo/api/v3/user/refresh_token with our device token returns
-// 403 "Forbidden" / errorCode=Forbidden — the endpoint is not for our
-// flow. Mark the auth refreshed-now and keep going; if a real expiry
-// happens the user re-runs --qoder-login.
+// Refresh keeps legacy device-token credentials unchanged and refreshes the
+// current PAT-derived Job Token credentials through Qoder's OpenAPI endpoint.
 func (e *QoderExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("qoder executor: auth is nil")
 	}
+	storage, ok := auth.Storage.(*qoderauth.QoderTokenStorage)
+	if !ok || storage == nil || storage.AuthMode != "job-token" {
+		return auth, nil
+	}
+	if strings.TrimSpace(storage.RefreshToken) == "" {
+		return nil, fmt.Errorf("qoder executor: job-token credential has no refresh token")
+	}
+	if storage.RefreshTokenExpireTime > 0 && storage.RefreshTokenExpireTime <= time.Now().UnixMilli() {
+		return nil, fmt.Errorf("qoder executor: job-token refresh token has expired; run -qoder-login again")
+	}
+
+	authSvc := qoderauth.NewQoderAuth(e.cfg)
+	tokenData, errRefresh := authSvc.RefreshJobToken(ctx, storage.RefreshToken)
+	if errRefresh != nil {
+		return nil, errRefresh
+	}
+	authSvc.UpdateTokenStorage(storage, tokenData)
+	if path := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); path != "" {
+		if errSave := storage.SaveTokenToFile(path); errSave != nil {
+			return nil, fmt.Errorf("qoder executor: save refreshed job-token credential: %w", errSave)
+		}
+	}
 	return auth, nil
+}
+
+func refreshQoderJobTokenIfNeeded(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) error {
+	if auth == nil {
+		return fmt.Errorf("qoder executor: auth is nil")
+	}
+	storage, ok := auth.Storage.(*qoderauth.QoderTokenStorage)
+	if !ok || storage == nil || storage.AuthMode != "job-token" {
+		return nil
+	}
+	if strings.TrimSpace(storage.RefreshToken) == "" {
+		return fmt.Errorf("qoder executor: job-token credential has no refresh token")
+	}
+	if storage.RefreshTokenExpireTime > 0 && storage.RefreshTokenExpireTime <= time.Now().UnixMilli() {
+		return fmt.Errorf("qoder executor: job-token refresh token has expired; run -qoder-login again")
+	}
+	if !storage.IsExpired(60 * 1000) {
+		return nil
+	}
+
+	authSvc := qoderauth.NewQoderAuth(cfg)
+	tokenData, errRefresh := authSvc.RefreshJobToken(ctx, storage.RefreshToken)
+	if errRefresh != nil {
+		return errRefresh
+	}
+	authSvc.UpdateTokenStorage(storage, tokenData)
+	if path := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); path != "" {
+		if errSave := storage.SaveTokenToFile(path); errSave != nil {
+			return fmt.Errorf("qoder executor: save refreshed job-token credential: %w", errSave)
+		}
+	}
+	return nil
 }
 
 // HttpRequest injects Qoder COSY authentication into the HTTP request and executes it
@@ -1364,6 +1414,10 @@ func (e *QoderExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	storage, ok := auth.Storage.(*qoderauth.QoderTokenStorage)
 	if !ok {
 		return nil, fmt.Errorf("invalid auth storage type for qoder")
+	}
+	endpoints, errEndpoints := qoderauth.ResolveEndpoints(e.cfg)
+	if errEndpoints != nil {
+		return nil, errEndpoints
 	}
 
 	// Read request body for COSY signing
@@ -1377,11 +1431,14 @@ func (e *QoderExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		bodyBytes,
 		req.URL.String(),
 		qoderauth.CosyCredentials{
-			UserID:    storage.UserID,
-			AuthToken: storage.Token,
-			Name:      storage.Name,
-			Email:     storage.Email,
-			MachineID: storage.MachineID,
+			UserID:           storage.UserID,
+			AuthToken:        storage.Token,
+			Name:             storage.Name,
+			Email:            storage.Email,
+			MachineID:        storage.MachineID,
+			OrganizationID:   storage.OrganizationID,
+			OrganizationTags: storage.OrganizationTags,
+			EnterpriseVPC:    endpoints.VPCInstance != "",
 		},
 	)
 	if err != nil {
@@ -1438,23 +1495,36 @@ func FetchQoderModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.
 		log.Debug("qoder: no token, returning static models")
 		return registry.GetQoderModels()
 	}
+	if errRefresh := refreshQoderJobTokenIfNeeded(ctx, auth, cfg); errRefresh != nil {
+		log.Warnf("qoder: refresh job token before model list: %v", errRefresh)
+		return registry.GetQoderModels()
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	endpoints, errEndpoints := qoderauth.ResolveEndpoints(cfg)
+	if errEndpoints != nil {
+		log.Warnf("qoder: resolve endpoints: %v", errEndpoints)
+		return registry.GetQoderModels()
+	}
+	modelListURL := endpoints.ModelListURL()
 
-	headers, err := qoderauth.BuildAuthHeaders(nil, qoderauth.QoderModelListURL, qoderauth.CosyCredentials{
-		UserID:    storage.UserID,
-		AuthToken: storage.Token,
-		Name:      storage.Name,
-		Email:     storage.Email,
-		MachineID: storage.MachineID,
+	headers, err := qoderauth.BuildAuthHeaders(nil, modelListURL, qoderauth.CosyCredentials{
+		UserID:           storage.UserID,
+		AuthToken:        storage.Token,
+		Name:             storage.Name,
+		Email:            storage.Email,
+		MachineID:        storage.MachineID,
+		OrganizationID:   storage.OrganizationID,
+		OrganizationTags: storage.OrganizationTags,
+		EnterpriseVPC:    endpoints.VPCInstance != "",
 	})
 	if err != nil {
 		log.Warnf("qoder: build cosy headers for model list: %v", err)
 		return registry.GetQoderModels()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, qoderauth.QoderModelListURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelListURL, nil)
 	if err != nil {
 		log.Warnf("qoder: build model list request: %v", err)
 		return registry.GetQoderModels()
@@ -1485,21 +1555,29 @@ func FetchQoderModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.
 		return registry.GetQoderModels()
 	}
 
-	chat := gjson.GetBytes(body, "chat")
-	if !chat.Exists() || !chat.IsArray() {
-		log.Warnf("qoder: model list response missing 'chat' array")
+	enterpriseVPC := endpoints.VPCInstance != ""
+	modelsByScene := qoderModelListEntries(body, enterpriseVPC)
+	if !modelsByScene.Exists() || !modelsByScene.IsArray() {
+		log.Warnf("qoder: model list response missing 'assistant' or legacy 'chat' array")
 		return registry.GetQoderModels()
 	}
 
 	now := time.Now().Unix()
 	models := make([]*registry.ModelInfo, 0, 16)
 	configs := make(map[string]json.RawMessage, 16)
-	chat.ForEach(func(_, entry gjson.Result) bool {
+	modelsByScene.ForEach(func(_, entry gjson.Result) bool {
 		key := entry.Get("key").String()
+		if key == "" {
+			key = entry.Get("model_key").String()
+		}
 		if key == "" {
 			return true
 		}
-		if !entry.Get("enable").Bool() {
+		if enterpriseVPC {
+			if entry.Get("enable").Exists() && !entry.Get("enable").Bool() {
+				return true
+			}
+		} else if !entry.Get("enable").Bool() {
 			return true
 		}
 		display := entry.Get("display_name").String()
@@ -1507,6 +1585,14 @@ func FetchQoderModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.
 			display = key
 		}
 		ctxLen := int(entry.Get("max_input_tokens").Int())
+		if ctxLen == 0 {
+			entry.Get("context_config").ForEach(func(_, contextEntry gjson.Result) bool {
+				if tokenCount := int(contextEntry.Get("token_count").Int()); tokenCount > ctxLen {
+					ctxLen = tokenCount
+				}
+				return true
+			})
+		}
 		isVL := entry.Get("is_vl").Bool()
 
 		// Cache the raw upstream JSON for this model so ExecuteStream can
@@ -1562,13 +1648,109 @@ func FetchQoderModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.
 
 	storage.SetModelConfigs(configs)
 
-	log.Infof("qoder: fetched %d models from /algo/api/v2/model/list", len(models))
+	modelListPath := "/algo/api/v2/model/list"
+	if enterpriseVPC {
+		modelListPath += "?Encode=1"
+	}
+	log.Infof("qoder: fetched %d models from %s", len(models), modelListPath)
 
 	// Fetch usage alongside models so the management UI has fresh credit data.
 	// Use context.Background() so the goroutine outlives the caller's context.
 	go FetchQoderUsage(context.Background(), auth, cfg)
 
 	return models
+}
+
+// qoderModelListEntries supports the legacy `chat` catalog plus the current
+// qoderclicn `assistant` scene. The current CLI treats assistant as its
+// default interactive scene and keeps all enabled entries in that array.
+func qoderModelListEntries(body []byte, enterpriseVPC bool) gjson.Result {
+	paths := []struct {
+		models     string
+		enterprise string
+	}{
+		{models: "chat"},
+		{models: "data.chat"},
+		{models: "assistant"},
+		{models: "data.assistant"},
+	}
+	if enterpriseVPC {
+		paths = []struct {
+			models     string
+			enterprise string
+		}{
+			{models: "assistant", enterprise: "byok_enterprise"},
+			{models: "data.assistant", enterprise: "data.byok_enterprise"},
+			{models: "chat"},
+			{models: "data.chat"},
+		}
+	}
+
+	for _, path := range paths {
+		entries := gjson.GetBytes(body, path.models)
+		if entries.Exists() && entries.IsArray() {
+			if path.enterprise != "" {
+				return mergeQoderEnterpriseModels(entries, gjson.GetBytes(body, path.enterprise))
+			}
+			return entries
+		}
+	}
+	return gjson.Result{}
+}
+
+// mergeQoderEnterpriseModels mirrors qoderclicn's catalog behavior: entries
+// published in the byok_enterprise scene are added to assistant when they are
+// not already present there. This keeps enterprise-provided model variants
+// visible without duplicating keys that the primary scene already defines.
+func mergeQoderEnterpriseModels(primary, enterprise gjson.Result) gjson.Result {
+	if !enterprise.Exists() || !enterprise.IsArray() {
+		return primary
+	}
+	var primaryEntries []json.RawMessage
+	if err := json.Unmarshal([]byte(primary.Raw), &primaryEntries); err != nil {
+		return primary
+	}
+	var enterpriseEntries []json.RawMessage
+	if err := json.Unmarshal([]byte(enterprise.Raw), &enterpriseEntries); err != nil {
+		return primary
+	}
+	seen := make(map[string]struct{}, len(primaryEntries)+len(enterpriseEntries))
+	for _, raw := range primaryEntries {
+		var entry map[string]interface{}
+		if json.Unmarshal(raw, &entry) == nil {
+			if key, ok := entry["key"].(string); ok && key != "" {
+				seen[key] = struct{}{}
+			}
+			if key, ok := entry["model_key"].(string); ok && key != "" {
+				seen[key] = struct{}{}
+			}
+		}
+	}
+	for _, raw := range enterpriseEntries {
+		var entry map[string]interface{}
+		if json.Unmarshal(raw, &entry) != nil {
+			continue
+		}
+		key := ""
+		if value, ok := entry["key"].(string); ok {
+			key = value
+		} else if value, ok := entry["model_key"].(string); ok {
+			key = value
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		primaryEntries = append(primaryEntries, raw)
+	}
+	combined, err := json.Marshal(primaryEntries)
+	if err != nil {
+		return primary
+	}
+	return gjson.ParseBytes(combined)
 }
 
 // stableHash returns a deterministic hex identifier from the given inputs.
@@ -1630,7 +1812,12 @@ func FetchQoderUsage(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 		return nil
 	}
 
-	const usageURL = "https://openapi.qoder.sh/api/v2/quota/usage"
+	endpoints, errEndpoints := qoderauth.ResolveEndpoints(cfg)
+	if errEndpoints != nil {
+		log.Debugf("qoder: resolve endpoints for usage: %v", errEndpoints)
+		return nil
+	}
+	usageURL := endpoints.UsageURL()
 	log.Debugf("qoder: fetching usage for user %s (token len=%d)", storage.UserID, len(storage.Token))
 	req, err := http.NewRequest(http.MethodGet, usageURL, nil)
 	if err != nil {

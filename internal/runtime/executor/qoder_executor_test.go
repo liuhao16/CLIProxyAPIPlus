@@ -1234,3 +1234,120 @@ func TestValidateQoderModel(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteStream_UsesQoderVPCGateway(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Qoder.VPCEndpoint = "acme.vpc.qoder.com.cn"
+	executor := NewQoderExecutor(cfg)
+	authRecord := &cliproxyauth.Auth{
+		ID:       "qoder-vpc-auth",
+		Provider: "qoder",
+		Storage:  testQoderStorageWithModelConfig(),
+	}
+
+	var requestURL string
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestURL = req.URL.String()
+		return qoderSSEHTTPResponse(req, http.StatusOK, "data: [DONE]\n\n"), nil
+	}))
+
+	result, err := executor.ExecuteStream(ctx, authRecord, cliproxyexecutor.Request{
+		Model:   "qoder/auto",
+		Payload: []byte(`{"model":"qoder/auto","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for range result.Chunks {
+	}
+
+	wantURL := "https://acme-gateway.vpc.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
+	if requestURL != wantURL {
+		t.Fatalf("request URL = %q, want %q", requestURL, wantURL)
+	}
+}
+
+func TestFetchQoderModels_UsesCurrentCNSceneAndProtocol(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Qoder.VPCEndpoint = "acme.vpc.qoder.com.cn"
+	storage := &qoder.QoderTokenStorage{
+		Token:          "jt-test",
+		UserID:         "user-1",
+		MachineID:      "11111111-2222-3333-4444-555555555555",
+		OrganizationID: "org-1",
+	}
+	auth := &cliproxyauth.Auth{Provider: "qoder", Storage: storage}
+
+	var captured *http.Request
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		captured = req.Clone(req.Context())
+		body := `{"assistant":[{"key":"cn-model","display_name":"CN Model","is_reasoning":true,"max_input_tokens":200000}]}`
+		if req.URL.Path == "/api/v2/quota/usage" {
+			body = `{"userQuota":{"total":100,"used":1,"remaining":99,"percentage":0.01,"unit":"credits"}}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	}))
+
+	models := FetchQoderModels(ctx, auth, cfg)
+	if len(models) != 1 {
+		t.Fatalf("models length = %d, want 1: %+v", len(models), models)
+	}
+	if models[0].ID != "qoder/cn-model" {
+		t.Fatalf("model ID = %q, want qoder/cn-model", models[0].ID)
+	}
+	if _, ok := storage.GetModelConfig("cn-model"); !ok {
+		t.Fatal("assistant model config was not cached")
+	}
+	if captured == nil {
+		t.Fatal("model-list request was not captured")
+	}
+	wantURL := "https://acme-gateway.vpc.qoder.com.cn/algo/api/v2/model/list?Encode=1"
+	if captured.URL.String() != wantURL {
+		t.Fatalf("model-list URL = %q, want %q", captured.URL.String(), wantURL)
+	}
+	if captured.Header.Get("Cosy-Version") != qoder.QoderGatewayCosyVersion {
+		t.Fatalf("Cosy-Version = %q, want %q", captured.Header.Get("Cosy-Version"), qoder.QoderGatewayCosyVersion)
+	}
+	if captured.Header.Get("Cosy-Machineos") != qoder.QoderCNMachineOS {
+		t.Fatalf("Cosy-Machineos = %q, want %q", captured.Header.Get("Cosy-Machineos"), qoder.QoderCNMachineOS)
+	}
+	if captured.Header.Get("Cosy-Organization-Id") != "org-1" {
+		t.Fatalf("Cosy-Organization-Id = %q, want org-1", captured.Header.Get("Cosy-Organization-Id"))
+	}
+}
+
+func TestQoderModelListEntriesMergesEnterpriseScene(t *testing.T) {
+	entries := qoderModelListEntries([]byte(`{
+		"assistant": [{"key":"shared","display_name":"Shared"}],
+		"byok_enterprise": [
+			{"model_key":"enterprise-only","display_name":"Enterprise"},
+			{"key":"shared","display_name":"Duplicate"}
+		]
+	}`), true)
+	if !entries.Exists() || !entries.IsArray() {
+		t.Fatalf("entries = %v, want array", entries)
+	}
+	if got := len(entries.Array()); got != 2 {
+		t.Fatalf("entry count = %d, want 2", got)
+	}
+	if entries.Get("1.model_key").String() != "enterprise-only" {
+		t.Fatalf("enterprise entry = %v", entries.Get("1"))
+	}
+}
+
+func TestQoderModelListEntriesMergesWrappedEnterpriseScene(t *testing.T) {
+	entries := qoderModelListEntries([]byte(`{
+		"data": {
+			"assistant": [{"key":"shared"}],
+			"byok_enterprise": [{"model_key":"enterprise-only"}]
+		}
+	}`), true)
+	if got := len(entries.Array()); got != 2 {
+		t.Fatalf("entry count = %d, want 2", got)
+	}
+}

@@ -9,6 +9,10 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// Qoder configures provider-wide Qoder request behavior, including how the
+	// proxy waits out the upstream's model queue and CN Enterprise VPC endpoints.
+	Qoder QoderConfig `yaml:"qoder,omitempty" json:"qoder,omitempty"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:

@@ -10,9 +10,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// DoQoderLogin handles the Qoder device flow using the shared authentication manager.
-// It initiates the device-based authentication process for Qoder services and saves
-// the authentication tokens to the configured auth directory.
+// DoQoderLogin handles Qoder authentication using the shared authentication
+// manager. Enterprise VPC uses the CN PAT -> Job Token flow; public Qoder keeps
+// its browser device flow.
 //
 // Parameters:
 //   - cfg: The application configuration

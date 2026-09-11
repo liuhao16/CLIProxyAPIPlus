@@ -1104,20 +1104,41 @@ func (h *Handler) RequestQoderToken(c *gin.Context) {
 		}
 
 		storage := qoderAuth.CreateTokenStorage(tokenData, deviceFlow.MachineID)
-		// Resolve a human-readable label: prefer the email from /userinfo,
-		// fall back to user_id, then to a timestamp so the auth file always
-		// gets a unique, non-empty name without prompting the operator.
-		name, email := qoderAuth.SaveUserInfo(ctx, tokenData.AccessToken, tokenData.UserID, "", "")
+		// Persist the organization identity as well as the display label. The
+		// current Qoder CN gateway requires organization_id in COSY headers.
+		name, email := "", ""
+		if qoderAuth.IsEnterpriseVPC() {
+			if details, errDetails := qoderAuth.FetchUserInfoDetails(ctx, tokenData.AccessToken); errDetails == nil {
+				if storage.UserID == "" {
+					storage.UserID = details.UserID
+				}
+				name = details.Name
+				email = details.Email
+				storage.OrganizationID = details.OrganizationID
+				storage.OrganizationTags = details.OrganizationTags
+			}
+		} else {
+			name, email = qoderAuth.SaveUserInfo(ctx, tokenData.AccessToken, tokenData.UserID, "", "")
+		}
 		storage.Name = name
 		switch {
 		case strings.TrimSpace(email) != "":
 			storage.Email = strings.TrimSpace(email)
-		case strings.TrimSpace(tokenData.UserID) != "":
-			storage.Email = strings.TrimSpace(tokenData.UserID)
+		case strings.TrimSpace(storage.UserID) != "":
+			storage.Email = strings.TrimSpace(storage.UserID)
 		default:
 			storage.Email = fmt.Sprintf("user-%d", time.Now().UnixMilli())
 		}
 		fileName := fmt.Sprintf("qoder-%s.json", storage.Email)
+		metadata := map[string]any{
+			"email":   storage.Email,
+			"name":    storage.Name,
+			"user_id": storage.UserID,
+		}
+		if qoderAuth.IsEnterpriseVPC() {
+			metadata["organization_id"] = storage.OrganizationID
+			metadata["organization_tags"] = storage.OrganizationTags
+		}
 		record := &coreauth.Auth{
 			ID:       fileName,
 			Provider: "qoder",
@@ -1132,7 +1153,7 @@ func (h *Handler) RequestQoderToken(c *gin.Context) {
 				return "Qoder User"
 			}(),
 			Storage:  storage,
-			Metadata: map[string]any{"email": storage.Email},
+			Metadata: metadata,
 		}
 		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, "qoder", record)
 		if errors.Is(errSave, errOAuthSessionNotPending) {
